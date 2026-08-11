@@ -20,6 +20,7 @@ between the model and the search engine.
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -38,6 +39,7 @@ MAX_SEARCH_RESULTS = 5
 MAX_TOKENS = 1200
 TEMPERATURE = 0.3
 MAX_SEARCH_ROUNDS = 6  # max number of tool-call rounds per user query
+MAX_PARALLEL_SEARCHES = 4  # searches run concurrently within one round
 
 
 # ============================================================
@@ -340,6 +342,8 @@ FINAL ANSWER RULES
                 }
             )
 
+            jobs = []
+
             for tc in tool_calls:
 
                 try:
@@ -355,16 +359,57 @@ FINAL ANSWER RULES
 
                     query = user_text
 
-                print(f"🔎 Searching: {query}")
+                jobs.append((tc, query))
 
-                results = self.search_engine.search(query)
+            print(
+                f"🔎 Searching x{len(jobs)} (parallel): "
+                + " | ".join(q for _, q in jobs)
+            )
+
+            # Run all searches for this round concurrently.
+            # Slowest single search now bounds the round, not the sum.
+            # Results are stashed and appended in the ORIGINAL tool-call
+            # order so tool messages always line up with tool_calls.
+            ordered_results = [None] * len(jobs)
+
+            with ThreadPoolExecutor(
+                max_workers=min(
+                    len(jobs),
+                    MAX_PARALLEL_SEARCHES,
+                )
+            ) as pool:
+
+                future_by_index = {}
+
+                for index, (tc, query) in enumerate(jobs):
+
+                    future_by_index[index] = pool.submit(
+                        self.search_engine.search,
+                        query,
+                    )
+
+                for index, future in future_by_index.items():
+
+                    try:
+
+                        ordered_results[index] = future.result()
+
+                    except Exception as e:
+
+                        print(f"⚠️ Search failed: {e}")
+
+                        ordered_results[index] = []
+
+            for index, (tc, query) in enumerate(jobs):
 
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": (
-                            self.search_engine.format_results(results)
+                            self.search_engine.format_results(
+                                ordered_results[index]
+                            )
                         ),
                     }
                 )

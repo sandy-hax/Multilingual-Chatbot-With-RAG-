@@ -15,6 +15,9 @@ edge-tts.
 - Speech input via microphone with Silero VAD
 - Whisper (faster-whisper) transcription, language auto-detection
 - LLM agent loop with `web_search` tool calling (OpenCode Zen, OpenAI-compatible)
+- Parallel web searches: multiple tool calls per round run concurrently via
+  `ThreadPoolExecutor` (up to `MAX_PARALLEL_SEARCHES=4`), usually ~4x faster than
+  running them one by one
 - Always searches for the latest data (current year is injected into prompts)
 - Language mirroring: Tanglish -> Tanglish, Tamil -> Tamil script, etc.
 - Soft acceptance chime when the wake word is detected / interrupt is accepted
