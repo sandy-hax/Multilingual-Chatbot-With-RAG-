@@ -5,6 +5,8 @@ import tempfile
 import os
 import sys
 import re
+import threading
+import time
 
 from huggingface_hub.utils import enable_progress_bars
 enable_progress_bars()
@@ -20,6 +22,10 @@ import torch
 from faster_whisper import WhisperModel
 import edge_tts
 from langdetect import detect
+
+from openwakeword import Model as WakeWordModel
+
+import openwakeword as _oww_pkg
 
 from llm_service import llm_service
 
@@ -39,13 +45,23 @@ SILENCE_PATIENCE_MS = 1000
 
 VOLUME_SCALE = 0.1
 
+# Wake word / interrupt detection (openWakeWord)
+WAKE_WORD_MODEL = "alexa_v0.1"
+WAKE_THRESHOLD = 0.5
+WAKE_COOLDOWN_S = 1.0
+
+# How long (seconds) of no wake-word activity before the
+# mic-stream is considered silent/idle again.
+WAKE_IDLE_TIMEOUT_S = 15.0
+
 
 # ============================================================
 # LANGUAGE / VOICE CONFIG
 # ============================================================
 
 VOICE_MAP = {
-    "en": "en-IN-NeerjaNeural",
+    "en": "en-IN-NeerjaExpressiveNeural",
+    "tl": "en-IN-NeerjaExpressiveNeural",
     "hi": "hi-IN-SwaraNeural",
     "ta": "ta-IN-PallaviNeural",
     "te": "te-IN-ShrutiNeural",
@@ -59,6 +75,7 @@ VOICE_MAP = {
 
 LANG_NAMES = {
     "en": "English",
+    "tl": "Tanglish",
     "hi": "Hindi",
     "ta": "Tamil",
     "te": "Telugu",
@@ -72,6 +89,8 @@ LANG_NAMES = {
 
 LANG_NAME_TO_CODE = {
     "english": "en",
+    "tanglish": "tl",
+    "thanglish": "tl",
     "hindi": "hi",
     "tamil": "ta",
     "telugu": "te",
@@ -83,7 +102,7 @@ LANG_NAME_TO_CODE = {
     "punjabi": "pa",
 }
 
-DEFAULT_VOICE = "en-IN-NeerjaNeural"
+DEFAULT_VOICE = "en-IN-NeerjaExpressiveNeural"
 
 
 # ============================================================
@@ -334,7 +353,7 @@ def detect_roman_indian_language(text):
 
     # One isolated matching word is not enough.
     if tamil_score >= 2 and tamil_score > hindi_score:
-        return "ta"
+        return "tl"
 
     if hindi_score >= 2 and hindi_score > tamil_score:
         return "hi"
@@ -416,10 +435,19 @@ LANGUAGE RULES:
 
 11. Punjabi input -> Punjabi output using Gurmukhi script.
 
-12. If the user speaks an Indian language using Latin characters,
-    understand the language correctly but reply using its native script.
+12. If the user speaks Hindi or other Indian languages using Latin
+    characters, understand the language correctly but reply using its
+    native script.
 
-13. NEVER romanize Indian languages.
+12a. SPECIAL CASE - Tanglish (Latin-script Tamil mixed with English):
+     When the user speaks Tamil using Latin characters, reply naturally
+     in the same Tanglish style, i.e. Tamil written in Latin script mixed
+     with everyday English words, exactly how Tamil speakers chat
+     (for example: "Apply panna mudiyum", "konjam wait pannungo").
+     Do NOT use Tamil script in this mode.
+
+13. NEVER romanize Indian languages except in Tanglish mode
+    described in rule 12a.
 
 14. Do not randomly switch languages.
 
@@ -522,26 +550,49 @@ else:
 
 print("Loading Silero VAD...")
 
-vad_model, vad_utils = torch.hub.load(
+vad_model, _ = torch.hub.load(
     repo_or_dir="snakers4/silero-vad",
     model="silero_vad",
 )
 
-(
-    get_speech_timestamps,
-    _,
-    _,
-    VADIterator,
-    _,
-) = vad_utils
+print("Silero VAD loaded.")
 
-vad_iterator = VADIterator(
-    vad_model,
-    threshold=VAD_THRESHOLD,
-    sampling_rate=SAMPLE_RATE,
+
+# ============================================================
+# WAKE WORD MODEL (openWakeWord "alexa")
+# ============================================================
+
+print("Loading wake word model...")
+
+WAKE_MODEL_PATH = os.path.join(
+    os.path.dirname(_oww_pkg.__file__),
+    "resources",
+    "models",
+    f"{WAKE_WORD_MODEL}.onnx",
 )
 
-print("Silero VAD loaded.")
+wake_word_model = WakeWordModel(
+    wakeword_model_paths=[WAKE_MODEL_PATH],
+)
+
+print(
+    "Wake word model loaded: "
+    f"{WAKE_WORD_MODEL}"
+)
+
+
+# ============================================================
+# THREAD STATE / EVENTS
+# ============================================================
+
+mode_lock = threading.Lock()
+current_mode = "idle"  # idle | acknowledging | listening | speaking
+
+wake_event = threading.Event()
+interrupt_event = threading.Event()
+utterance_event = threading.Event()
+utterance_audio = None
+stop_event = threading.Event()
 
 
 # ============================================================
@@ -574,18 +625,56 @@ def update_system_prompt():
 
 
 # ============================================================
-# AUDIO CAPTURE WITH VAD
+# AUDIO CAPTURE WITH VAD + WAKE WORD WORKER
 # ============================================================
 
-def listen_for_utterance():
+def play_acceptance_sound():
+    """
+    Play a soft, barely-audible 'accepted' blip,
+    well below normal speech volume.
+    """
+    sr = 22050
 
-    print("\n🎤 Listening...")
+    duration = 0.35
 
-    vad_iterator.reset_states()
+    t = np.linspace(
+        0,
+        duration,
+        int(sr * duration),
+        endpoint=False,
+    )
 
-    recorded = []
+    # Single gentle tone with a slow fade in/out
+    tone = np.sin(2 * np.pi * 1174 * t)
 
-    triggered = False
+    envelope = np.minimum(
+        t / 0.1,
+        (duration - t) / 0.2,
+    )
+    envelope = np.clip(envelope, 0, 1)
+
+    blip = tone * envelope * 0.4
+
+    # Low volume: a small fraction of normal speech level
+    soft_blip = blip * VOLUME_SCALE * 0.5
+
+    sd.play(
+        soft_blip.astype("float32"),
+        sr,
+    )
+
+    sd.wait()
+
+
+def audio_worker():
+    """
+    Background thread: owns the single persistent mic stream.
+
+    - idle / speaking  -> runs openWakeWord to detect "alexa"
+    - listening        -> runs Silero VAD to capture an utterance
+    """
+
+    global current_mode, utterance_audio
 
     chunk_size = 512
 
@@ -598,7 +687,34 @@ def listen_for_utterance():
         * chunks_per_second
     )
 
+    recorded = []
+    triggered = False
     silence_counter = 0
+
+    # openWakeWord expects 16 kHz int16 mono in 1280-sample
+    # (80 ms) frames. We accumulate raw float chunks into
+    # an int16 buffer and slice frames off the front.
+    ww_buffer = np.zeros(0, dtype=np.int16)
+
+    last_wake_time = 0.0
+
+    # When switching to "listening", drain a short period of
+    # audio so the echo of the "Yes"/acceptance chime that
+    # just played does not get captured as user speech.
+    SETTLE_CHUNKS = int(
+        0.6 * SAMPLE_RATE / 512
+    )
+    settle_chunks = 0
+    prev_mode = None
+
+    # When leaving "listening", the user's own just-finished
+    # speech is still sitting in the audio queue. Drain it and
+    # reset the wake model so that tail can't false-trigger
+    # "alexa" once we resume wake-word detection.
+    WW_SETTLE_CHUNKS = int(
+        1.0 * SAMPLE_RATE / 512
+    )
+    ww_settle_chunks = 0
 
     try:
 
@@ -610,52 +726,183 @@ def listen_for_utterance():
             callback=audio_callback,
         ):
 
-            while True:
+            while not stop_event.is_set():
 
                 chunk = audio_q.get()
 
                 chunk = chunk.flatten()
 
-                with torch.no_grad():
+                with mode_lock:
+                    mode = current_mode
 
-                    speech_prob = vad_model(
-                        torch.from_numpy(chunk),
-                        SAMPLE_RATE,
-                    ).item()
+                if mode != prev_mode:
 
-                if speech_prob > VAD_THRESHOLD:
+                    # Mode changed.
+                    if mode == "listening":
 
-                    if not triggered:
+                        recorded = []
+                        triggered = False
+                        silence_counter = 0
+                        settle_chunks = SETTLE_CHUNKS
 
-                        triggered = True
+                    else:
 
-                        print(
-                            "  ...speech started"
-                        )
+                        # Leaving listening: the captured utterance
+                        # (and its trailing audio still in the queue)
+                        # must not feed the wake-word detector.
+                        ww_buffer = np.zeros(0, dtype=np.int16)
+                        ww_settle_chunks = WW_SETTLE_CHUNKS
 
-                    silence_counter = 0
+                        with mode_lock:
+                            wake_word_model.reset()
 
-                else:
+                    prev_mode = mode
+
+                if mode == "listening":
+
+                    if settle_chunks > 0:
+
+                        # Drain echo of the acceptance sound
+                        settle_chunks -= 1
+                        continue
+
+                    # ------------------------------------
+                    # VAD-based utterance capture
+                    # ------------------------------------
+
+                    with torch.no_grad():
+
+                        speech_prob = vad_model(
+                            torch.from_numpy(chunk),
+                            SAMPLE_RATE,
+                        ).item()
+
+                    if speech_prob > VAD_THRESHOLD:
+
+                        if not triggered:
+
+                            triggered = True
+
+                            print(
+                                "  ...speech started"
+                            )
+
+                        silence_counter = 0
+
+                    else:
+
+                        if triggered:
+                            silence_counter += 1
 
                     if triggered:
-                        silence_counter += 1
 
-                if triggered:
-
-                    recorded.append(
-                        chunk
-                    )
-
-                    if (
-                        silence_counter
-                        > max_silence_chunks
-                    ):
-
-                        print(
-                            "  ...speech finished"
+                        recorded.append(
+                            chunk
                         )
 
-                        break
+                        if (
+                            silence_counter
+                            > max_silence_chunks
+                        ):
+
+                            print(
+                                "  ...speech finished"
+                            )
+
+                            utterance_audio = (
+                                np.concatenate(recorded)
+                            )
+
+                            recorded = []
+                            triggered = False
+                            silence_counter = 0
+
+                            with mode_lock:
+                                current_mode = "idle"
+
+                            utterance_event.set()
+
+                elif mode in ("idle", "speaking", "processing"):
+
+                    # ------------------------------------
+                    # Wake word detection
+                    # ------------------------------------
+
+                    if ww_settle_chunks > 0:
+
+                        # Drain the tail of the user's own
+                        # just-finished speech.
+                        ww_settle_chunks -= 1
+                        continue
+
+                    int16 = (
+                        np.clip(
+                            chunk,
+                            -1.0,
+                            1.0,
+                        )
+                        * 32767.0
+                    ).astype(np.int16)
+
+                    ww_buffer = (
+                        np.concatenate(
+                            [ww_buffer, int16]
+                        )
+                    )
+
+                    while len(ww_buffer) >= 1280:
+
+                        frame = ww_buffer[:1280]
+
+                        ww_buffer = ww_buffer[1280:]
+
+                        predictions = (
+                            wake_word_model.predict(
+                                frame,
+                            )
+                        )
+
+                        score = predictions.get(
+                            WAKE_WORD_MODEL,
+                            0.0,
+                        )
+
+                        if score > WAKE_THRESHOLD:
+
+                            now = time.time()
+
+                            if (
+                                now - last_wake_time
+                                > WAKE_COOLDOWN_S
+                            ):
+
+                                last_wake_time = now
+
+                                with mode_lock:
+                                    mode_now = current_mode
+
+                                if mode_now == "idle":
+
+                                    print(
+                                        "\n🔔 Wake word "
+                                        "detected!"
+                                    )
+
+                                    wake_event.set()
+
+                                elif (
+                                    mode_now
+                                    in ("speaking", "processing")
+                                ):
+
+                                    print(
+                                        "\n⏹️ Interrupt "
+                                        "detected!"
+                                    )
+
+                                    interrupt_event.set()
+
+                # 'acknowledging' -> just drain audio
 
     except sd.PortAudioError as e:
 
@@ -664,14 +911,15 @@ def listen_for_utterance():
             f"{e}"
         )
 
-        return None
+    except Exception as e:
 
-    if not recorded:
-        return None
+        print(
+            f"⚠️ Audio worker error: {e}"
+        )
 
-    return np.concatenate(
-        recorded
-    )
+    finally:
+
+        print("Audio worker stopped.")
 
 
 # ============================================================
@@ -729,11 +977,17 @@ def transcribe(audio_np):
 
 async def speak(
     text,
-    lang_code
+    lang_code,
+    interruptible=False
 ):
+    """
+    Speak `text`. If interruptible, monitor the mic
+    wake-word and stop playback early when "alexa"
+    is detected. Returns True if interrupted.
+    """
 
     if not text:
-        return
+        return False
 
     voice = VOICE_MAP.get(
         lang_code,
@@ -774,7 +1028,43 @@ async def speak(
             sr
         )
 
-        sd.wait()
+        if not interruptible:
+
+            sd.wait()
+
+            return False
+
+        # ----------------------------------------
+        # Interruptible playback: keep draining
+        # the output stream while listening for
+        # the wake word to stop us.
+        # ----------------------------------------
+
+        interrupted = False
+
+        while True:
+
+            stream = sd.get_stream()
+
+            if (
+                stream is None
+                or not stream.active
+            ):
+                break
+
+            if interrupt_event.is_set():
+
+                interrupt_event.clear()
+
+                sd.stop()
+
+                interrupted = True
+
+                break
+
+            await asyncio.sleep(0.05)
+
+        return interrupted
 
     except Exception as e:
 
@@ -786,6 +1076,8 @@ async def speak(
         print(
             f"Reply text: {text}"
         )
+
+        return False
 
     finally:
 
@@ -805,7 +1097,8 @@ async def speak(
 
 def ask_opencode(
     user_text,
-    detected_lang
+    detected_lang,
+    cancel_event=None
 ):
 
     global sticky_lang
@@ -852,7 +1145,27 @@ def ask_opencode(
     # Explicit language instruction
     # ----------------------------------------
 
-    language_instruction = f"""
+    if response_lang == "tl":
+
+        language_instruction = """
+The user's actual language is Tanglish (Tamil mixed with English,
+written using Latin characters).
+
+You MUST respond entirely in Tanglish.
+
+IMPORTANT:
+
+- Reply naturally in Tanglish, exactly how Tamil speakers chat.
+- Write Tamil in Latin script mixed with everyday English words.
+- Examples: "Apply panna mudiyum", "konjam wait pannungo",
+  "ee scheme la eligibility ennana?", "income limit kaala venum".
+- Do NOT use Tamil script.
+- Keep it conversational and easy to read aloud.
+"""
+
+    else:
+
+        language_instruction = f"""
 The user's actual language is {language_name}.
 
 You MUST respond entirely in {language_name}.
@@ -877,6 +1190,7 @@ IMPORTANT:
         base_system_prompt=build_system_prompt(),
         language_instruction=language_instruction,
         chat_history=chat_history,
+        cancel_event=cancel_event,
     )
 
     return reply
@@ -934,7 +1248,7 @@ def format_json_response(
 
 def main():
 
-    global sticky_lang
+    global sticky_lang, current_mode
 
     print(
         "\n===================================="
@@ -949,166 +1263,358 @@ def main():
     )
 
     print(
-        "Speak anytime. "
+        "Say 'alexa' to start a conversation. "
+        "Say 'alexa' while I speak to interrupt. "
         "Press Ctrl+C to quit."
     )
 
-    while True:
+    # ----------------------------------------
+    # Start the persistent mic / wake word
+    # background thread.
+    # ----------------------------------------
 
-        try:
+    worker = threading.Thread(
+        target=audio_worker,
+        daemon=True,
+    )
 
-            # ----------------------------------------
-            # LISTEN
-            # ----------------------------------------
+    worker.start()
 
-            audio_np = (
-                listen_for_utterance()
-            )
+    try:
 
-            if (
-                audio_np is None
-                or len(audio_np)
-                < SAMPLE_RATE * 0.3
-            ):
-                continue
+        while True:
 
-            # ----------------------------------------
-            # WHISPER
-            # ----------------------------------------
-
-            text, whisper_lang = (
-                transcribe(
-                    audio_np
-                )
-            )
-
-            if not text:
-                continue
-
-            # ----------------------------------------
-            # LANGUAGE RESOLUTION
-            # ----------------------------------------
-
-            detected_lang = (
-                determine_language(
-                    text,
-                    whisper_lang
-                )
-            )
-
-            # ----------------------------------------
-            # HALLUCINATION FILTER
-            # ----------------------------------------
-
-            clean_text = (
-                text
-                .lower()
-                .strip(".!? ")
-            )
-
-            if (
-                clean_text
-                in HALLUCINATION_PHRASES
-            ):
-
-                print(
-                    "⚠️ Ignored Whisper "
-                    "hallucination."
-                )
-
-                continue
-
-            # ----------------------------------------
-            # DISPLAY
-            # ----------------------------------------
+            # ================================
+            # 1. IDLE - wait for wake word
+            # ================================
 
             print(
-                f"\n🗣️ You "
-                f"({detected_lang}): {text}"
+                "\n🔇 Waiting for wake word... "
+                "(say 'alexa')"
             )
 
-            if whisper_lang != detected_lang:
+            wake_event.clear()
 
-                print(
-                    f"   Whisper detected: "
-                    f"{whisper_lang}"
-                )
+            wake_event.wait()
 
-                print(
-                    f"   Corrected to: "
-                    f"{detected_lang}"
-                )
-
-            # ----------------------------------------
-            # OPENCODE ZEN
-            # ----------------------------------------
-
-            reply = ask_opencode(
-                text,
-                detected_lang
-            )
-
-            # ----------------------------------------
-            # TTS LANGUAGE
-            # ----------------------------------------
-
-            if sticky_lang:
-
-                reply_lang = sticky_lang
-
-            else:
-
-                reply_lang = detected_lang
-
-            # ----------------------------------------
-            # DISPLAY RESPONSE
-            # ----------------------------------------
+            wake_event.clear()
 
             print(
-                f"🤖 Assistant "
-                f"({reply_lang}): {reply}"
+                "\n✅ Wake word detected!"
             )
 
             # ----------------------------------------
-            # JSON
+            # Acknowledge: say "yes" + acceptance
+            # sound, then listen for the user.
             # ----------------------------------------
 
-            sys.stdout.write(
-                format_json_response(
-                    reply
-                )
-                + "\n"
-            )
-
-            sys.stdout.flush()
-
-            # ----------------------------------------
-            # SPEAK
-            # ----------------------------------------
+            with mode_lock:
+                current_mode = "acknowledging"
 
             asyncio.run(
                 speak(
-                    clean_for_tts(reply),
-                    reply_lang
+                    "Yes",
+                    "en"
                 )
             )
 
-        except KeyboardInterrupt:
+            play_acceptance_sound()
+
+            with mode_lock:
+                current_mode = "listening"
 
             print(
-                "\n\nExiting."
+                "\n🎤 Listening..."
             )
 
-            break
+            # ================================
+            # 2. CONVERSATION LOOP
+            # ================================
 
-        except Exception as e:
+            while True:
 
-            print(
-                f"⚠️ Error encountered: "
-                f"{e}"
-            )
+                # ----------------------------------------
+                # Wait for a captured utterance
+                # ----------------------------------------
 
-            continue
+                utterance_ready = (
+                    utterance_event.wait(
+                        timeout=WAKE_IDLE_TIMEOUT_S
+                    )
+                )
+
+                if not utterance_ready:
+
+                    # Nobody spoke in time; back to idle
+                    with mode_lock:
+                        current_mode = "idle"
+
+                    print(
+                        "\n⏳ No speech detected. "
+                        "Back to idle."
+                    )
+
+                    break
+
+                utterance_event.clear()
+
+                with mode_lock:
+                    current_mode = "processing"
+
+                audio_np = utterance_audio
+
+                if (
+                    audio_np is None
+                    or len(audio_np)
+                    < SAMPLE_RATE * 0.3
+                ):
+                    continue
+
+                # ----------------------------------------
+                # Run transcription + LLM search in a
+                # background thread so "alexa" can cancel
+                # the search while it is still running.
+                # ----------------------------------------
+
+                result_box = {}
+                cancel_event = threading.Event()
+                done_event = threading.Event()
+
+                def _process():
+
+                    try:
+
+                        # WHISPER
+                        text, whisper_lang = (
+                            transcribe(
+                                audio_np
+                            )
+                        )
+
+                        if not text:
+
+                            result_box["done"] = True
+                            return
+
+                        # LANGUAGE RESOLUTION
+                        detected_lang = (
+                            determine_language(
+                                text,
+                                whisper_lang
+                            )
+                        )
+
+                        # HALLUCINATION FILTER
+                        clean_text = (
+                            text
+                            .lower()
+                            .strip(".!? ")
+                        )
+
+                        if (
+                            clean_text
+                            in HALLUCINATION_PHRASES
+                        ):
+
+                            result_box["ignored"] = True
+                            result_box["done"] = True
+                            return
+
+                        # OPENCODE ZEN (cancellable)
+                        reply = ask_opencode(
+                            text,
+                            detected_lang,
+                            cancel_event=cancel_event,
+                        )
+
+                        result_box["text"] = text
+                        result_box["whisper_lang"] = whisper_lang
+                        result_box["detected_lang"] = detected_lang
+                        result_box["reply"] = reply
+
+                    except Exception as e:
+
+                        print(
+                            f"⚠️ Processing error: {e}"
+                        )
+
+                    finally:
+
+                        result_box["done"] = True
+                        done_event.set()
+
+                threading.Thread(
+                    target=_process,
+                    daemon=True,
+                ).start()
+
+                # ----------------------------------------
+                # Wait, allowing "alexa" to cancel
+                # ----------------------------------------
+
+                cancelled = False
+
+                while not done_event.is_set():
+
+                    if interrupt_event.is_set():
+
+                        interrupt_event.clear()
+
+                        cancel_event.set()
+
+                        cancelled = True
+
+                        with mode_lock:
+                            current_mode = "acknowledging"
+
+                        play_acceptance_sound()
+
+                        with mode_lock:
+                            current_mode = "listening"
+
+                        print(
+                            "\n🎤 Listening..."
+                        )
+
+                        break
+
+                    time.sleep(0.05)
+
+                # Cancelled mid-search: re-listen
+                if cancelled or not result_box.get("done"):
+                    continue
+
+                if result_box.get("ignored"):
+
+                    print(
+                        "⚠️ Ignored Whisper "
+                        "hallucination."
+                    )
+
+                    continue
+
+                text = result_box["text"]
+                whisper_lang = result_box["whisper_lang"]
+                detected_lang = result_box["detected_lang"]
+                reply = result_box["reply"]
+
+                # ----------------------------------------
+                # DISPLAY
+                # ----------------------------------------
+
+                print(
+                    f"\n🗣️ You "
+                    f"({detected_lang}): {text}"
+                )
+
+                if whisper_lang != detected_lang:
+
+                    print(
+                        f"   Whisper detected: "
+                        f"{whisper_lang}"
+                    )
+
+                    print(
+                        f"   Corrected to: "
+                        f"{detected_lang}"
+                    )
+
+                # ----------------------------------------
+                # TTS LANGUAGE
+                # ----------------------------------------
+
+                if sticky_lang:
+
+                    reply_lang = sticky_lang
+
+                else:
+
+                    reply_lang = detected_lang
+
+                # ----------------------------------------
+                # DISPLAY RESPONSE
+                # ----------------------------------------
+
+                print(
+                    f"🤖 Assistant "
+                    f"({reply_lang}): {reply}"
+                )
+
+                # ----------------------------------------
+                # JSON
+                # ----------------------------------------
+
+                sys.stdout.write(
+                    format_json_response(
+                        reply
+                    )
+                    + "\n"
+                )
+
+                sys.stdout.flush()
+
+                # ----------------------------------------
+                # SPEAK (interruptible)
+                # ----------------------------------------
+
+                with mode_lock:
+                    current_mode = "speaking"
+
+                interrupted = asyncio.run(
+                    speak(
+                        clean_for_tts(reply),
+                        reply_lang,
+                        interruptible=True
+                    )
+                )
+
+                if interrupted:
+
+                    # User said "alexa" while we spoke:
+                    # stop, chime, and listen again.
+                    with mode_lock:
+                        current_mode = "acknowledging"
+
+                    play_acceptance_sound()
+
+                    with mode_lock:
+                        current_mode = "listening"
+
+                    print(
+                        "\n🎤 Listening..."
+                    )
+
+                    continue
+
+                # Reply finished normally; keep the
+                # conversation going. The inner loop only
+                # returns to idle when nobody speaks for
+                # WAKE_IDLE_TIMEOUT_S, so we just continue
+                # listening without needing "alexa" again.
+                with mode_lock:
+                    current_mode = "listening"
+
+                print(
+                    "\n🎤 Listening..."
+                )
+
+                continue
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n\nExiting."
+        )
+
+    finally:
+
+        stop_event.set()
+
+        sd.stop()
+
+        worker.join(
+            timeout=2.0
+        )
 
 
 # ============================================================

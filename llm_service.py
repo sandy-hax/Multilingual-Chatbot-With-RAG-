@@ -35,7 +35,7 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
 LLM_MODEL = os.environ.get("OPENCODE_MODEL", "deepseek-v4-flash-free")
 
 MAX_SEARCH_RESULTS = 5
-MAX_TOKENS = 400
+MAX_TOKENS = 1200
 TEMPERATURE = 0.3
 MAX_SEARCH_ROUNDS = 6  # max number of tool-call rounds per user query
 
@@ -243,7 +243,7 @@ FINAL ANSWER RULES
             + language_instruction
         )
 
-    def _run_agent_loop(self, system_prompt, user_text, prior_turns):
+    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None):
         """
         Run the tool-calling loop until the model answers or the
         round limit is reached. Returns the final text reply.
@@ -267,6 +267,12 @@ FINAL ANSWER RULES
         )
 
         for _ in range(MAX_SEARCH_ROUNDS):
+
+            if (
+                cancel_event
+                and cancel_event.is_set()
+            ):
+                return ""
 
             response = (
                 self.client
@@ -372,6 +378,7 @@ FINAL ANSWER RULES
         base_system_prompt,
         language_instruction,
         chat_history,
+        cancel_event=None,
     ):
         """
         Search the web (as many rounds as the model wants) and return
@@ -379,6 +386,10 @@ FINAL ANSWER RULES
 
         chat_history is mutated in place (user + assistant turns
         are appended) so multi-turn context is preserved.
+
+        If cancel_event (a threading.Event) is set while searching,
+        the loop stops early and returns "" (nothing is added to
+        chat_history).
         """
 
         if self.client is None:
@@ -413,6 +424,7 @@ FINAL ANSWER RULES
                 system_prompt=system_prompt,
                 user_text=user_text,
                 prior_turns=prior_turns,
+                cancel_event=cancel_event,
             )
 
         except Exception as e:
@@ -423,6 +435,15 @@ FINAL ANSWER RULES
                 "Sorry, I couldn't reach "
                 "the assistant service right now."
             )
+
+        # Interrupted mid-search: discard the partial reply
+        # and DO NOT remember this turn.
+        if (
+            cancel_event
+            and cancel_event.is_set()
+        ):
+
+            return ""
 
         if not reply:
 
