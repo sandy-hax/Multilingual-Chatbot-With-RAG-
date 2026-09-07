@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PACS Operator Portal | Citizen Grievance Management</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        .pacs-container {
+            max-width: 1300px;
+            margin: 0 auto;
+            padding: 30px 24px;
+            height: 100vh;
+            overflow-y: auto;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: var(--bg-glass);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--card-border);
+            padding: 20px;
+            border-radius: var(--radius-md);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .stat-icon {
+            width: 50px;
+            height: 50px;
+            border-radius: var(--radius-sm);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            background: rgba(99, 102, 241, 0.15);
+            color: var(--accent-indigo);
+        }
+        .stat-icon.pending { background: rgba(245, 158, 11, 0.15); color: #f59e0b; }
+        .stat-icon.in-progress { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+        .stat-icon.resolved { background: rgba(16, 185, 129, 0.15); color: #10b981; }
+        .stat-val { font-size: 1.8rem; font-weight: 700; }
+        .stat-lbl { font-size: 0.85rem; color: var(--text-muted); }
+
+        .filter-bar {
+            background: var(--bg-glass);
+            border: 1px solid var(--card-border);
+            padding: 16px;
+            border-radius: var(--radius-md);
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+        }
+        .table-card {
+            background: var(--bg-glass);
+            border: 1px solid var(--card-border);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+        }
+        table.pacs-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        table.pacs-table th, table.pacs-table td {
+            padding: 14px 18px;
+            text-align: left;
+            border-bottom: 1px solid var(--card-border);
+        }
+        table.pacs-table th {
+            background: rgba(255, 255, 255, 0.04);
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+        .badge-status {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-weight: 600;
+            font-size: 0.78rem;
+        }
+        .badge-status.Pending { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
+        .badge-status.In-Progress { background: rgba(59, 130, 246, 0.2); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.4); }
+        .badge-status.Resolved { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
+        .badge-status.Rejected { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    </style>
+</head>
+<body class="dark-theme">
+
+    <div class="pacs-container">
+        <!-- PACS HEADER -->
+        <header class="app-header" style="border-radius: var(--radius-md); margin-bottom: 24px;">
+            <div class="header-left">
+                <h1>PACS Operator Grievance Management Portal</h1>
+                <div class="header-badges">
+                    <span class="badge model-badge"><i class="fa-solid fa-building-columns"></i> Cooperative Societies & PACS</span>
+                    <span class="badge status-badge"><i class="fa-solid fa-database"></i> Postgres DB Active</span>
+                </div>
+            </div>
+            <div class="header-controls">
+                <a href="/" class="btn btn-secondary">
+                    <i class="fa-solid fa-comments"></i> Back to Assistant
+                </a>
+            </div>
+        </header>
+
+        <!-- ANALYTICS STATS GRID -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon"><i class="fa-solid fa-ticket"></i></div>
+                <div>
+                    <div class="stat-val" id="statTotal">0</div>
+                    <div class="stat-lbl">Total Grievances</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon pending"><i class="fa-solid fa-clock"></i></div>
+                <div>
+                    <div class="stat-val" id="statPending">0</div>
+                    <div class="stat-lbl">Pending Review</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon in-progress"><i class="fa-solid fa-spinner"></i></div>
+                <div>
+                    <div class="stat-val" id="statInProgress">0</div>
+                    <div class="stat-lbl">In Progress</div>
+                </div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon resolved"><i class="fa-solid fa-circle-check"></i></div>
+                <div>
+                    <div class="stat-val" id="statResolved">0</div>
+                    <div class="stat-lbl">Resolved Tickets</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FILTER BAR -->
+        <div class="filter-bar">
+            <div style="display: flex; gap: 12px; align-items: center;">
+                <div class="select-wrapper">
+                    <i class="fa-solid fa-filter"></i>
+                    <select id="filterStatus" onchange="loadGrievances()">
+                        <option value="all">All Statuses</option>
+                        <option value="Pending">Pending</option>
+                        <option value="In Progress">In Progress</option>
+                        <option value="Resolved">Resolved</option>
+                    </select>
+                </div>
+                <div class="select-wrapper">
+                    <i class="fa-solid fa-building"></i>
+                    <select id="filterDept" onchange="loadGrievances()">
+                        <option value="all">All Departments</option>
+                        <option value="PACS Cooperative Society">PACS Cooperative Society</option>
+                        <option value="PMFBY Crop Insurance">PMFBY Crop Insurance</option>
+                        <option value="Agriculture & Farmers Welfare">Agriculture Welfare</option>
+                        <option value="Public Distribution System (PDS)">PDS Ration</option>
+                    </select>
+                </div>
+            </div>
+            <button class="btn btn-outline" onclick="loadGrievances()">
+                <i class="fa-solid fa-arrows-rotate"></i> Refresh Data
+            </button>
+        </div>
+
+        <!-- COMPLAINTS TABLE -->
+        <div class="table-card">
+            <table class="pacs-table">
+                <thead>
+                    <tr>
+                        <th>Tracking ID</th>
+                        <th>Citizen Name</th>
+                        <th>Phone</th>
+                        <th>Department</th>
+                        <th>PACS / Location</th>
+                        <th>Status</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="grievanceTableBody">
+                    <tr>
+                        <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 40px;">
+                            Loading citizen grievances...
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- TICKET DETAIL & RESOLUTION MODAL -->
+    <div class="modal-backdrop hidden" id="ticketModal">
+        <div class="modal-card" style="max-width: 650px;">
+            <div class="modal-header">
+                <h3>Manage Grievance Ticket</h3>
+                <button class="close-btn" onclick="closeTicketModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="ticketModalBody">
+                <!-- Form content dynamically inserted by JS -->
+            </div>
+        </div>
+    </div>
+
+    <!-- PACS JavaScript -->
+    <script src="/static/js/pacs.js"></script>
+</body>
+</html>

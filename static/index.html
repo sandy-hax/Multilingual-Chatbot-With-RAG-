@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multilingual AI Voice & RAG Assistant | Nemotron 3.5</title>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body class="dark-theme">
+    <div class="app-container">
+        
+        <!-- SIDEBAR: RAG Knowledge Base & Settings -->
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <i class="fa-solid fa-brain-circuit glow-icon"></i>
+                    <span>Knowledge Hub</span>
+                </div>
+                <span class="badge-tag">Hybrid RAG</span>
+            </div>
+
+            <!-- Drag & Drop File Upload -->
+            <div class="upload-card">
+                <div class="drop-zone" id="dropZone">
+                    <i class="fa-solid fa-cloud-arrow-up upload-icon"></i>
+                    <p class="drop-title">Drop PDF, Image or Text</p>
+                    <p class="drop-sub">Auto OCR & Chunking</p>
+                    <input type="file" id="fileInput" hidden accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp,.docx">
+                    <button class="btn btn-outline btn-sm" onclick="document.getElementById('fileInput').click()">
+                        <i class="fa-solid fa-folder-open"></i> Browse Files
+                    </button>
+                </div>
+                <div class="upload-progress hidden" id="uploadProgress">
+                    <div class="spinner"></div>
+                    <span id="uploadStatusText">Running OCR & Ingestion...</span>
+                </div>
+            </div>
+
+            <!-- Ingested Documents List -->
+            <div class="document-section">
+                <div class="section-title">
+                    <span>Indexed Knowledge</span>
+                    <span class="chunk-badge" id="docCountBadge">0 files</span>
+                </div>
+                <div class="doc-list" id="docList">
+                    <div class="empty-docs">
+                        <i class="fa-solid fa-file-circle-question"></i>
+                        <p>No documents uploaded yet.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System Info Footer -->
+            <div class="sidebar-footer">
+                <div class="status-item">
+                    <span class="status-dot online"></span>
+                    <span class="status-label">LLM Engine:</span>
+                    <span class="status-value" id="modelNameLabel">Nemotron 3.5</span>
+                </div>
+                <div class="status-item">
+                    <span class="status-dot online"></span>
+                    <span class="status-label">Embeddings:</span>
+                    <span class="status-value">HF MiniLM-L6</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- MAIN CONTENT AREA -->
+        <main class="main-content">
+            
+            <!-- HEADER BAR -->
+            <header class="app-header">
+                <div class="header-left">
+                    <h1>Multilingual Citizen Voice Assistant</h1>
+                    <div class="header-badges">
+                        <span class="badge model-badge"><i class="fa-solid fa-microchip"></i> Nemotron 3.5 Flash Free</span>
+                        <span class="badge status-badge"><i class="fa-solid fa-bolt"></i> OpenCode Zen</span>
+                    </div>
+                </div>
+                
+                <div class="header-controls">
+                    <!-- Language Selection Dropdown -->
+                    <div class="select-wrapper">
+                        <i class="fa-solid fa-language"></i>
+                        <select id="languageSelect">
+                            <option value="auto">Auto Detect</option>
+                            <option value="en">English</option>
+                            <option value="tl">Tanglish</option>
+                            <option value="ta">Tamil (தமிழ்)</option>
+                            <option value="hi">Hindi (हिन्दी)</option>
+                            <option value="te">Telugu (తెలుగు)</option>
+                            <option value="kn">Kannada (ಕನ್ನಡ)</option>
+                            <option value="bn">Bengali (বাংলা)</option>
+                            <option value="mr">Marathi (मराठी)</option>
+                            <option value="ml">Malayalam (മലയാളം)</option>
+                        </select>
+                    </div>
+
+                    <!-- Architecture Diagram Modal Trigger -->
+                    <button class="btn btn-secondary" onclick="openArchModal()">
+                        <i class="fa-solid fa-diagram-project"></i> Flow Diagram
+                    </button>
+                </div>
+            </header>
+
+            <!-- CHAT FEED AREA -->
+            <div class="chat-container" id="chatContainer">
+                <div class="chat-welcome">
+                    <div class="welcome-icon">
+                        <i class="fa-solid fa-comments"></i>
+                    </div>
+                    <h2>How can I assist you today?</h2>
+                    <p>Ask questions about government schemes, PACS bye-laws, or upload official documents for instant RAG analysis.</p>
+                    
+                    <div class="suggestion-chips">
+                        <button class="chip" onclick="sendQuickQuery('What are the eligibility rules for PMFBY crop insurance?')">
+                            <i class="fa-solid fa-wheat-awn"></i> PMFBY Crop Insurance
+                        </button>
+                        <button class="chip" onclick="sendQuickQuery('Tamil-la PACS bye-laws explain pannoonga')">
+                            <i class="fa-solid fa-landmark"></i> Tanglish PACS Scheme
+                        </button>
+                        <button class="chip" onclick="sendQuickQuery('How to file a grievance on CPGRAMS portal?')">
+                            <i class="fa-solid fa-headset"></i> Complaint / Grievance
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CHAT INPUT & VOICE CONTROL BAR -->
+            <footer class="input-bar-container">
+                <div class="input-card">
+                    <!-- Voice Recording Visualizer Overlay -->
+                    <div class="recording-overlay hidden" id="recordingOverlay">
+                        <div class="pulse-wave"></div>
+                        <span id="recordingText">Listening... Speak now</span>
+                        <button class="btn btn-danger btn-sm" onclick="stopRecording()">
+                            <i class="fa-solid fa-square"></i> Stop
+                        </button>
+                    </div>
+
+                    <!-- Text Input Controls -->
+                    <div class="input-row">
+                        <button class="icon-btn mic-btn" id="micBtn" title="Voice Input (Microphone)" onclick="toggleRecording()">
+                            <i class="fa-solid fa-microphone"></i>
+                        </button>
+
+                        <textarea id="userInput" placeholder="Ask in Tanglish, Tamil, Hindi, or English..." rows="1"></textarea>
+
+                        <button class="icon-btn send-btn" id="sendBtn" title="Send Query" onclick="submitMessage()">
+                            <i class="fa-solid fa-paper-plane"></i>
+                        </button>
+                    </div>
+                </div>
+            </footer>
+
+        </main>
+    </div>
+
+    <!-- ARCHITECTURE FLOW MODAL -->
+    <div class="modal-backdrop hidden" id="archModal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>System Architecture & Intent Routing</h3>
+                <button class="close-btn" onclick="closeArchModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="arch-flow-grid">
+                    <div class="arch-box">
+                        <i class="fa-solid fa-microphone-lines"></i>
+                        <h4>Input & Speech</h4>
+                        <p>Silero VAD + Faster-Whisper transcribe and detect sticky user language.</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-box highlight">
+                        <i class="fa-solid fa-route"></i>
+                        <h4>Intent Router</h4>
+                        <p>Routes to RAG Knowledge Base, Web Search engine, or Grievance flow.</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-box">
+                        <i class="fa-solid fa-layer-group"></i>
+                        <h4>Hybrid RAG</h4>
+                        <p>Dense vector search + BM25 keyword matching fused with RRF ranking.</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-box glow">
+                        <i class="fa-solid fa-robot"></i>
+                        <h4>Nemotron 3.5 LLM</h4>
+                        <p>Generates grounded answer in native script / Tanglish + TTS speech audio.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom JS -->
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

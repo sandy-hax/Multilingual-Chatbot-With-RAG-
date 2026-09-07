@@ -33,7 +33,7 @@ load_dotenv()
 
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
-LLM_MODEL = os.environ.get("OPENCODE_MODEL", "deepseek-v4-flash-free")
+LLM_MODEL = os.environ.get("OPENCODE_MODEL", "nemotron-3.5-flash-free")
 
 MAX_SEARCH_RESULTS = 5
 MAX_TOKENS = 1200
@@ -46,16 +46,153 @@ MAX_PARALLEL_SEARCHES = 4  # searches run concurrently within one round
 # SEARCH ENGINE
 # ============================================================
 
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "").strip()
+SERPER_API_URL = "https://google.serper.dev/search"
+SERPER_QPS_LIMIT = 10.0  # max requests/second; soft cap for short bursts
+
+
 class SearchEngine:
     """
-    Lightweight web search using DuckDuckGo (ddgs).
+    Web search using the Serper.dev API when a SERPER_API_KEY is
+    configured, with DuckDuckGo (ddgs) as a keyless fallback.
 
-    Free, fast, and requires no API key. Returns a list of
-    dicts with 'title', 'url' and 'snippet' for the top hits.
+    Serper is a no-billing-required eval tier (2,500 free queries)
+    and returns Google results fast over a single connection.
+
+    One persistent httpx.Client is reused for every query so a single
+    HTTPS connection pool serves all searches (no per-query TLS/session
+    setup). Returns a list of dicts with 'title', 'url' and 'snippet'.
     """
+
+    def __init__(self):
+
+        import threading
+
+        self._client = None
+        self._client_lock = threading.Lock()
+        self._last_request_ts = 0.0
+        self._rate_lock = threading.Lock()
+
+    # -- connection management ----------------------------------
+
+    def _get_client(self):
+        """Return the shared httpx.Client, creating it once on first use."""
+
+        if self._client is None:
+
+            with self._client_lock:
+
+                if self._client is None:
+
+                    import httpx
+
+                    self._client = httpx.Client(
+                        timeout=httpx.Timeout(10.0, connect=5.0),
+                        headers={
+                            "Accept": "application/json",
+                        },
+                    )
+
+        return self._client
+
+    def close(self):
+        """Close the shared connection pool."""
+
+        if self._client is not None:
+
+            with self._client_lock:
+
+                if self._client is not None:
+
+                    self._client.close()
+
+                    self._client = None
+
+    # -- search ---------------------------------------------------
 
     def search(self, query, max_results=MAX_SEARCH_RESULTS):
         """Search the web for `query` and return top results."""
+
+        if SERPER_API_KEY:
+
+            results = self._search_serper(query, max_results)
+
+            if results:
+
+                return results
+
+            print("ℹ️ Serper returned nothing; falling back to DuckDuckGo.")
+
+        return self._search_ddg(query, max_results)
+
+    # -- Serper ---------------------------------------------------
+
+    def _search_serper(self, query, max_results):
+        """Prefer Serper (fast, one reused connection, no billing)."""
+
+        import time
+
+        try:
+
+            # Soft throttle for parallel callers: keep roughly SERPER_QPS_LIMIT
+            # requests/second, but never sleep longer than ~1s so short
+            # bursts still go out immediately.
+            with self._rate_lock:
+
+                min_interval = 1.0 / SERPER_QPS_LIMIT
+
+                wait = min_interval - (
+                    time.monotonic() - self._last_request_ts
+                )
+
+                if wait > 0:
+
+                    time.sleep(min(wait, 1.0))
+
+                self._last_request_ts = time.monotonic()
+
+            response = self._get_client().post(
+                SERPER_API_URL,
+                headers={
+                    "X-API-KEY": SERPER_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "q": query,
+                    "num": min(max_results, 20),
+                    "gl": "in",
+                    "hl": "en",
+                },
+            )
+
+            response.raise_for_status()
+
+            payload = response.json()
+
+            raw_results = payload.get("organic") or []
+
+            results = [
+                {
+                    "title": item.get("title", ""),
+                    "url": item.get("link", ""),
+                    "snippet": item.get("snippet", ""),
+                }
+                for item in raw_results
+                if item.get("link")
+            ]
+
+            return results[:max_results]
+
+        except Exception as e:
+
+            print(f"⚠️ Serper search failed: {e}")
+
+            return []
+
+    # -- DuckDuckGo fallback --------------------------------------
+
+    def _search_ddg(self, query, max_results):
+        """Keyless fallback (one persistent ddgs session, not per-query)."""
 
         try:
             from ddgs import DDGS
@@ -82,7 +219,7 @@ class SearchEngine:
 
         except Exception as e:
 
-            print(f"⚠️ Web search failed: {e}")
+            print(f"⚠️ DuckDuckGo search failed: {e}")
 
             return []
 
@@ -118,12 +255,9 @@ WEB_SEARCH_TOOL = {
     "function": {
         "name": "web_search",
         "description": (
-            "Search the web for information. Use this whenever you need "
-            "fresh or detailed facts about government schemes, "
+            "Search the web for fresh facts about government schemes, "
             "eligibility, age limits, application steps, amounts, etc. "
-            "You may call it multiple times with different queries to "
-            "gather everything the user asked about. Always include the "
-            "current year in the query to get the latest data."
+            "Use this when information is not found in the local document RAG knowledge base."
         ),
         "parameters": {
             "type": "object",
@@ -137,6 +271,50 @@ WEB_SEARCH_TOOL = {
                 }
             },
             "required": ["query"],
+        },
+    },
+}
+
+RAG_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "rag_search",
+        "description": (
+            "Search the local RAG knowledge base (PACS Bye-Laws, PMFBY guidelines, "
+            "uploaded scheme documents, PDFs, scanned image text). "
+            "Always call this tool FIRST for specific scheme guidelines or uploaded files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keywords or search phrase in English or native language.",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+GRIEVANCE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "file_grievance",
+        "description": (
+            "Initiate or update a formal citizen grievance form. "
+            "Call this whenever the user wants to lodge a complaint, report loan delay, "
+            "unpaid insurance claims, PACS issues, or request official dispute resolution."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_complaint": {
+                    "type": "string",
+                    "description": "Summary of user's complaint or answer to follow-up question.",
+                }
+            },
+            "required": ["user_complaint"],
         },
     },
 }
@@ -283,7 +461,7 @@ FINAL ANSWER RULES
                 .create(
                     model=LLM_MODEL,
                     messages=messages,
-                    tools=[WEB_SEARCH_TOOL],
+                    tools=[WEB_SEARCH_TOOL, RAG_SEARCH_TOOL, GRIEVANCE_TOOL],
                     tool_choice="auto",
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
@@ -308,13 +486,12 @@ FINAL ANSWER RULES
                     return reply
 
                 # Empty response — nudge the model to retry instead
-                # of giving up silently.
                 messages.append(
                     {
                         "role": "user",
                         "content": (
                             "You returned an empty reply. Please answer the "
-                            "user's question now. Use the web_search tool if "
+                            "user's question now. Use the tools if "
                             "you need more information, then give your final "
                             "answer in the user's language."
                         ),
@@ -323,7 +500,7 @@ FINAL ANSWER RULES
 
                 continue
 
-            # Execute each requested search and feed results back
+            # Execute each requested tool call and feed results back
             messages.append(
                 {
                     "role": "assistant",
@@ -342,77 +519,49 @@ FINAL ANSWER RULES
                 }
             )
 
-            jobs = []
+            from rag_service import rag_service
+            from grievance_service import grievance_service
 
             for tc in tool_calls:
-
+                fn_name = tc.function.name
                 try:
-
-                    args = json.loads(
-                        tc.function.arguments
-                        or "{}"
-                    )
-
-                    query = args.get("query", user_text)
-
+                    args = json.loads(tc.function.arguments or "{}")
+                    query = args.get("query") or args.get("user_complaint") or user_text
                 except Exception:
-
                     query = user_text
 
-                jobs.append((tc, query))
-
-            print(
-                f"🔎 Searching x{len(jobs)} (parallel): "
-                + " | ".join(q for _, q in jobs)
-            )
-
-            # Run all searches for this round concurrently.
-            # Slowest single search now bounds the round, not the sum.
-            # Results are stashed and appended in the ORIGINAL tool-call
-            # order so tool messages always line up with tool_calls.
-            ordered_results = [None] * len(jobs)
-
-            with ThreadPoolExecutor(
-                max_workers=min(
-                    len(jobs),
-                    MAX_PARALLEL_SEARCHES,
-                )
-            ) as pool:
-
-                future_by_index = {}
-
-                for index, (tc, query) in enumerate(jobs):
-
-                    future_by_index[index] = pool.submit(
-                        self.search_engine.search,
-                        query,
-                    )
-
-                for index, future in future_by_index.items():
-
-                    try:
-
-                        ordered_results[index] = future.result()
-
-                    except Exception as e:
-
-                        print(f"⚠️ Search failed: {e}")
-
-                        ordered_results[index] = []
-
-            for index, (tc, query) in enumerate(jobs):
-
-                messages.append(
-                    {
+                if fn_name == "rag_search":
+                    print(f"📚 RAG Searching: {query}")
+                    rag_docs = rag_service.hybrid_search(query, top_k=4)
+                    rag_content = rag_service.format_rag_context(rag_docs) or "No relevant local documents found."
+                    messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": (
-                            self.search_engine.format_results(
-                                ordered_results[index]
-                            )
-                        ),
-                    }
-                )
+                        "content": rag_content,
+                    })
+                elif fn_name == "file_grievance":
+                    print(f"📝 Grievance Filing: {query}")
+                    res = grievance_service.process_grievance_turn(query)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": res["prompt"],
+                    })
+                elif fn_name == "web_search":
+                    print(f"🔎 Web Searching: {query}")
+                    web_results = self.search_engine.search(query)
+                    web_content = self.search_engine.format_results(web_results)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": web_content,
+                    })
+                else:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "Unknown tool function.",
+                    })
 
         # Round limit reached without a final answer
         return ""

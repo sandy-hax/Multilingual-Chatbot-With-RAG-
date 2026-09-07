@@ -1,7 +1,8 @@
-# Multilingual Voice Assistant
-# Voice-to-voice chatbot with live web search (DuckDuckGo) and LLM tool calling.
+# Multilingual Voice Assistant with RAG & Web UI
+# Powered by Nemotron 3.5 Flash Free (OpenCode Zen)
 
 openai>=2.0.0
+httpx>=0.27.0
 ddgs>=9.0.0
 faster-whisper>=1.0.0
 edge-tts>=6.1.0
@@ -11,3 +12,21 @@ sounddevice>=0.4.6
 soundfile>=0.12.0
 torch>=2.0.0
 python-dotenv>=1.0.0
+
+# Web Application & API
+fastapi>=0.100.0
+uvicorn>=0.22.0
+python-multipart>=0.0.6
+
+# RAG Vector Search & Embeddings
+sentence-transformers>=2.2.2
+rank-bm25>=0.2.2
+
+# Database (PostgreSQL & SQLite)
+psycopg2-binary>=2.9.6
+sqlalchemy>=2.0.0
+easyocr>=1.7.0
+pdfplumber>=0.9.0
+pypdf>=3.9.0
+pillow>=9.5.0
+python-docx>=0.8.11

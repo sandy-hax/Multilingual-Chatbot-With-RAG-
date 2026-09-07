@@ -54,6 +54,13 @@ WAKE_COOLDOWN_S = 1.0
 # mic-stream is considered silent/idle again.
 WAKE_IDLE_TIMEOUT_S = 15.0
 
+# Ignore "alexa" interrupts during the first N seconds of LLM
+# processing. The tail of the user's own just-finished speech can
+# still false-trigger the wake model right after they stop talking,
+# and no genuine interrupt is needed before transcription/search
+# has had time to start.
+INTERRUPT_GRACE_S = 2.0
+
 
 # ============================================================
 # LANGUAGE / VOICE CONFIG
@@ -592,6 +599,7 @@ wake_event = threading.Event()
 interrupt_event = threading.Event()
 utterance_event = threading.Event()
 utterance_audio = None
+last_utterance_ts = 0.0
 stop_event = threading.Event()
 
 
@@ -674,7 +682,7 @@ def audio_worker():
     - listening        -> runs Silero VAD to capture an utterance
     """
 
-    global current_mode, utterance_audio
+    global current_mode, utterance_audio, last_utterance_ts
 
     chunk_size = 512
 
@@ -712,7 +720,7 @@ def audio_worker():
     # reset the wake model so that tail can't false-trigger
     # "alexa" once we resume wake-word detection.
     WW_SETTLE_CHUNKS = int(
-        1.0 * SAMPLE_RATE / 512
+        1.5 * SAMPLE_RATE / 512
     )
     ww_settle_chunks = 0
 
@@ -820,7 +828,18 @@ def audio_worker():
                             with mode_lock:
                                 current_mode = "idle"
 
+                            last_utterance_ts = time.time()
+
                             utterance_event.set()
+
+                            # Stop here THIS iteration: the chunk
+                            # containing the tail of the user's speech
+                            # must not fall through into wake-word
+                            # detection below, or it can false-trigger
+                            # "alexa". Next iteration's mode-change
+                            # branch handles the ww_settle drain +
+                            # model reset.
+                            continue
 
                 elif mode in ("idle", "speaking", "processing"):
 
@@ -894,6 +913,18 @@ def audio_worker():
                                     mode_now
                                     in ("speaking", "processing")
                                 ):
+
+                                    # Skip the false-interrupt window
+                                    # right after the user spoke: the
+                                    # tail of their speech can trick
+                                    # the wake model into thinking
+                                    # "alexa" was said.
+                                    if (
+                                        time.time()
+                                        - last_utterance_ts
+                                        < INTERRUPT_GRACE_S
+                                    ):
+                                        continue
 
                                     print(
                                         "\n⏹️ Interrupt "
@@ -1454,29 +1485,43 @@ def main():
 
                 cancelled = False
 
+                # Right after an utterance, the wake model can still
+                # false-fire on the tail of the user's own speech.
+                # Ignore interrupts for a short grace period so we
+                # don't cancel a real answer over that.
+                processing_started = time.time()
+
                 while not done_event.is_set():
 
                     if interrupt_event.is_set():
 
                         interrupt_event.clear()
 
-                        cancel_event.set()
+                        if (
+                            time.time() - processing_started
+                            > INTERRUPT_GRACE_S
+                        ):
 
-                        cancelled = True
+                            cancel_event.set()
 
-                        with mode_lock:
-                            current_mode = "acknowledging"
+                            cancelled = True
 
-                        play_acceptance_sound()
+                            with mode_lock:
+                                current_mode = "acknowledging"
 
-                        with mode_lock:
-                            current_mode = "listening"
+                            play_acceptance_sound()
 
-                        print(
-                            "\n🎤 Listening..."
-                        )
+                            with mode_lock:
+                                current_mode = "listening"
 
-                        break
+                            print(
+                                "\n🎤 Listening..."
+                            )
+
+                            break
+
+                        # Within the grace window: a spurious
+                        # interrupt, ignore it and keep waiting.
 
                     time.sleep(0.05)
 
@@ -1615,6 +1660,8 @@ def main():
         worker.join(
             timeout=2.0
         )
+
+        llm_service.search_engine.close()
 
 
 # ============================================================
