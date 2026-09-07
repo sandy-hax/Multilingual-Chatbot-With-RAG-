@@ -6,9 +6,16 @@ Extracts clean text from PDFs, TXT/MD files, DOCX, and images (PNG, JPG, WEBP).
 Uses PyPDF / pdfplumber for digital PDFs and EasyOCR / PIL for image OCR.
 """
 
+import sys
 import os
 import io
 from PIL import Image
+
+# Force UTF-8 on Windows terminals (cp1252 can't print emoji)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Global EasyOCR reader instance initialized lazily
 _easyocr_reader = None

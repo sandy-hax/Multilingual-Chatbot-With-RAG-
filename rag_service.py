@@ -9,12 +9,19 @@ Lightweight Hybrid RAG (Retrieval-Augmented Generation) Service.
   4. Section & Clause aware text chunking
 """
 
+import sys
 import os
 import json
 import re
 import math
 from typing import List, Dict, Any, Tuple
 import numpy as np
+
+# Force UTF-8 on Windows terminals (cp1252 can't print emoji)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from ocr_service import ocr_service
 
@@ -30,9 +37,12 @@ class RAGService:
         os.makedirs(self.storage_dir, exist_ok=True)
         self.meta_file = os.path.join(self.storage_dir, "documents.json")
 
-        self.documents: List[Dict[str, Any]] = [] # [{id, filename, chunk_index, text, meta}]
+        self.documents: List[Dict[str, Any]] = []  # [{id, filename, chunk_index, text, meta}]
         self.embeddings: List[np.ndarray] = []
         self.embed_model = None
+        # [Fix 3] BM25 index cache — invalidated on any document change
+        self._bm25_index = None
+        self._bm25_corpus_len: int = 0
 
         self._load_metadata()
         self._init_embedding_model()
@@ -180,6 +190,7 @@ class RAGService:
                 self.embeddings.append(new_embeds[i])
             added_count += 1
 
+        self._bm25_index = None  # [Fix 3] Invalidate BM25 cache on new docs
         self._save_metadata()
         print(f"✅ Ingested '{filename}': {added_count} chunks stored.")
         return {
@@ -210,6 +221,7 @@ class RAGService:
         if self.embeddings:
             self.embeddings = [e for i, e in enumerate(self.embeddings) if i not in indices_to_remove]
 
+        self._bm25_index = None  # [Fix 3] Invalidate BM25 cache
         self._save_metadata()
         print(f"🗑️ Removed document '{filename}' from RAG index.")
         return True
@@ -218,6 +230,7 @@ class RAGService:
         """Clear all ingested documents."""
         self.documents = []
         self.embeddings = []
+        self._bm25_index = None  # [Fix 3] Invalidate BM25 cache
         self._save_metadata()
 
     # ============================================================
@@ -243,8 +256,27 @@ class RAGService:
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]
 
+    def _get_bm25(self):
+        """
+        [Fix 3] Return a cached BM25Okapi index, rebuilding only when the
+        document corpus has changed (add / delete / clear operations reset
+        self._bm25_index to None).
+        """
+        if self._bm25_index is not None and self._bm25_corpus_len == len(self.documents):
+            return self._bm25_index
+
+        try:
+            from rank_bm25 import BM25Okapi
+            corpus = [re.findall(r'\w+', d['text'].lower()) for d in self.documents]
+            self._bm25_index = BM25Okapi(corpus)
+            self._bm25_corpus_len = len(self.documents)
+        except Exception:
+            self._bm25_index = None
+
+        return self._bm25_index
+
     def _sparse_search(self, query: str, top_k: int = 10) -> List[Tuple[int, float]]:
-        """Sparse BM25 / Keyword search."""
+        """Sparse BM25 / Keyword search using cached index."""
         if not self.documents:
             return []
 
@@ -252,25 +284,23 @@ class RAGService:
         if not query_terms:
             return []
 
-        # Try using rank_bm25 if available
-        try:
-            from rank_bm25 import BM25Okapi
-            corpus = [re.findall(r'\w+', d['text'].lower()) for d in self.documents]
-            bm25 = BM25Okapi(corpus)
+        # [Fix 3] Use cached BM25 index instead of rebuilding each call
+        bm25 = self._get_bm25()
+        if bm25 is not None:
             doc_scores = bm25.get_scores(query_terms)
             scored = [(idx, float(score)) for idx, score in enumerate(doc_scores)]
             scored.sort(key=lambda x: x[1], reverse=True)
             return scored[:top_k]
-        except Exception:
-            # Simple keyword frequency fallback
-            scored = []
-            for idx, d in enumerate(self.documents):
-                text_lower = d['text'].lower()
-                matches = sum(text_lower.count(term) for term in query_terms)
-                if matches > 0:
-                    scored.append((idx, float(matches)))
-            scored.sort(key=lambda x: x[1], reverse=True)
-            return scored[:top_k]
+
+        # Simple keyword frequency fallback (if rank_bm25 not installed)
+        scored = []
+        for idx, d in enumerate(self.documents):
+            text_lower = d['text'].lower()
+            matches = sum(text_lower.count(term) for term in query_terms)
+            if matches > 0:
+                scored.append((idx, float(matches)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k]
 
     def hybrid_search(self, query: str, top_k: int = 4, rrf_k: int = 60) -> List[Dict[str, Any]]:
         """

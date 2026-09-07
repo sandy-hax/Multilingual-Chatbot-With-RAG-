@@ -18,9 +18,16 @@ The model does NOT access the internet itself. This file is the bridge
 between the model and the search engine.
 """
 
+import sys
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+
+# Force UTF-8 on Windows terminals (cp1252 can't print emoji)
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -33,7 +40,7 @@ load_dotenv()
 
 OPENCODE_API_KEY = os.environ.get("OPENCODE_API_KEY")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/v1"
-LLM_MODEL = os.environ.get("OPENCODE_MODEL", "nemotron-3.5-flash-free")
+LLM_MODEL = os.environ.get("OPENCODE_MODEL", "nemotron-3-ultra-free")
 
 MAX_SEARCH_RESULTS = 5
 MAX_TOKENS = 1200
@@ -352,6 +359,7 @@ class LLMService:
             self.client = OpenAI(
                 api_key=OPENCODE_API_KEY,
                 base_url=OPENCODE_BASE_URL,
+                default_headers={"x-opencode-session": "multilingual-rag-session"},
             )
 
             print(
@@ -423,7 +431,7 @@ FINAL ANSWER RULES
             + language_instruction
         )
 
-    def _run_agent_loop(self, system_prompt, user_text, prior_turns, cancel_event=None):
+    def _run_agent_loop(self, system_prompt, user_text, prior_turns, session_id, cancel_event=None):
         """
         Run the tool-calling loop until the model answers or the
         round limit is reached. Returns the final text reply.
@@ -541,7 +549,8 @@ FINAL ANSWER RULES
                     })
                 elif fn_name == "file_grievance":
                     print(f"📝 Grievance Filing: {query}")
-                    res = grievance_service.process_grievance_turn(query)
+                    # [Fix 2] Pass session_id so draft persists across tool calls
+                    res = grievance_service.process_grievance_turn(query, session_id=session_id)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -594,6 +603,12 @@ FINAL ANSWER RULES
             )
 
         # ----------------------------------------
+        # [Fix 2] Unique session ID for grievance draft tracking
+        # ----------------------------------------
+        import uuid as _uuid
+        session_id = _uuid.uuid4().hex
+
+        # ----------------------------------------
         # 1. Build the system prompt
         # ----------------------------------------
 
@@ -618,6 +633,7 @@ FINAL ANSWER RULES
                 system_prompt=system_prompt,
                 user_text=user_text,
                 prior_turns=prior_turns,
+                session_id=session_id,
                 cancel_event=cancel_event,
             )
 
@@ -641,9 +657,10 @@ FINAL ANSWER RULES
 
         if not reply:
 
+            # [Fix 8] Include language hint so TTS can read the message correctly
             reply = (
-                "I couldn't find an answer "
-                "for that right now. Please try again."
+                "I couldn't find an answer for that right now. "
+                "Please try rephrasing or ask again."
             )
 
         # ----------------------------------------

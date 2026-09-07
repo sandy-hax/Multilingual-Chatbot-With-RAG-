@@ -338,6 +338,13 @@ async function deleteDocument(filename) {
 
 function setupInputListeners() {
     const inputElem = document.getElementById("userInput");
+
+    // [Fix 9] Auto-resize textarea height as user types
+    inputElem.addEventListener("input", () => {
+        inputElem.style.height = "auto";
+        inputElem.style.height = Math.min(inputElem.scrollHeight, 160) + "px";
+    });
+
     inputElem.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();

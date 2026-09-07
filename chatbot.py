@@ -29,6 +29,20 @@ import openwakeword as _oww_pkg
 
 from llm_service import llm_service
 
+# [Fix 1] Import shared language config from speech_config so that
+# importing chatbot.py does not duplicate definitions already in speech_config.
+from speech_config import (
+    VOICE_MAP,
+    LANG_NAMES,
+    LANG_NAME_TO_CODE,
+    DEFAULT_VOICE,
+    BASE_SYSTEM_PROMPT,
+    detect_switch_request,
+    detect_script_language,
+    detect_roman_indian_language,
+    determine_language,
+)
+
 
 # ============================================================
 # CONFIG
@@ -63,53 +77,10 @@ INTERRUPT_GRACE_S = 2.0
 
 
 # ============================================================
-# LANGUAGE / VOICE CONFIG
+# LANGUAGE / VOICE CONFIG  — imported from speech_config.py
 # ============================================================
-
-VOICE_MAP = {
-    "en": "en-IN-NeerjaExpressiveNeural",
-    "tl": "en-IN-NeerjaExpressiveNeural",
-    "hi": "hi-IN-SwaraNeural",
-    "ta": "ta-IN-PallaviNeural",
-    "te": "te-IN-ShrutiNeural",
-    "kn": "kn-IN-SapnaNeural",
-    "bn": "bn-IN-TanishaaNeural",
-    "mr": "mr-IN-AarohiNeural",
-    "gu": "gu-IN-DhwaniNeural",
-    "ml": "ml-IN-SobhanaNeural",
-    "pa": "pa-IN-VaaniNeural",
-}
-
-LANG_NAMES = {
-    "en": "English",
-    "tl": "Tanglish",
-    "hi": "Hindi",
-    "ta": "Tamil",
-    "te": "Telugu",
-    "kn": "Kannada",
-    "bn": "Bengali",
-    "mr": "Marathi",
-    "gu": "Gujarati",
-    "ml": "Malayalam",
-    "pa": "Punjabi",
-}
-
-LANG_NAME_TO_CODE = {
-    "english": "en",
-    "tanglish": "tl",
-    "thanglish": "tl",
-    "hindi": "hi",
-    "tamil": "ta",
-    "telugu": "te",
-    "kannada": "kn",
-    "bengali": "bn",
-    "marathi": "mr",
-    "gujarati": "gu",
-    "malayalam": "ml",
-    "punjabi": "pa",
-}
-
-DEFAULT_VOICE = "en-IN-NeerjaExpressiveNeural"
+# (VOICE_MAP, LANG_NAMES, LANG_NAME_TO_CODE, DEFAULT_VOICE already
+#  imported at the top of this file from speech_config)
 
 
 # ============================================================
@@ -126,348 +97,18 @@ HALLUCINATION_PHRASES = [
 
 
 # ============================================================
-# LANGUAGE SWITCH DETECTION
+# LANGUAGE SWITCH / STICKY LANGUAGE STATE
 # ============================================================
-
-SWITCH_PATTERN = re.compile(
-    r"\b(?:in|to|into|speak|talk|reply|respond|switch)\s+("
-    + "|".join(LANG_NAME_TO_CODE.keys())
-    + r")\b",
-    re.IGNORECASE,
-)
+# detect_switch_request() imported from speech_config
 
 sticky_lang = None
 
 
-def detect_switch_request(text):
-    """
-    Detect explicit commands such as:
-
-        talk in English
-        speak in Tamil
-        reply in Hindi
-        switch to Telugu
-        respond in Kannada
-    """
-
-    match = SWITCH_PATTERN.search(text.lower())
-
-    if match:
-        language_name = match.group(1).lower()
-        return LANG_NAME_TO_CODE.get(language_name)
-
-    return None
-
-
 # ============================================================
-# NATIVE SCRIPT LANGUAGE DETECTION
+# LANGUAGE DETECTION / SYSTEM PROMPT  — imported from speech_config.py
 # ============================================================
-
-def detect_script_language(text):
-    """
-    Detect Indian languages based on Unicode script.
-
-    This is more reliable than langdetect for short text.
-    """
-
-    for char in text:
-
-        code = ord(char)
-
-        # Devanagari
-        if 0x0900 <= code <= 0x097F:
-            return "hi"
-
-        # Bengali
-        if 0x0980 <= code <= 0x09FF:
-            return "bn"
-
-        # Gurmukhi
-        if 0x0A00 <= code <= 0x0A7F:
-            return "pa"
-
-        # Gujarati
-        if 0x0A80 <= code <= 0x0AFF:
-            return "gu"
-
-        # Tamil
-        if 0x0B80 <= code <= 0x0BFF:
-            return "ta"
-
-        # Telugu
-        if 0x0C00 <= code <= 0x0C7F:
-            return "te"
-
-        # Kannada
-        if 0x0C80 <= code <= 0x0CFF:
-            return "kn"
-
-        # Malayalam
-        if 0x0D00 <= code <= 0x0D7F:
-            return "ml"
-
-    return None
-
-
-# ============================================================
-# ROMANIZED INDIAN LANGUAGE DETECTION
-# ============================================================
-
-def detect_roman_indian_language(text):
-    """
-    Detect Tanglish / Hinglish only when there is
-    reasonably strong evidence.
-
-    This prevents normal English sentences from
-    accidentally being classified as Hindi/Tamil.
-    """
-
-    text = text.lower().strip()
-
-    words = set(
-        re.findall(r"[a-z]+", text)
-    )
-
-    # ----------------------------------------
-    # Tamil / Tanglish
-    # ----------------------------------------
-
-    tamil_words = {
-        "panna",
-        "mudiyuma",
-        "mudiyum",
-        "enna",
-        "epdi",
-        "eppadi",
-        "iruka",
-        "irukinga",
-        "irukiya",
-        "panra",
-        "panren",
-        "pannunga",
-        "venum",
-        "vendam",
-        "illai",
-        "illa",
-        "aama",
-        "sollunga",
-        "sollu",
-        "inga",
-        "anga",
-        "romba",
-        "nalla",
-        "saptiya",
-        "saaptiya",
-        "sapten",
-        "saapten",
-        "theriyuma",
-        "theriyala",
-        "kudunga",
-        "kudu",
-        "vaanga",
-        "pora",
-        "poren",
-        "poga",
-        "vandhu",
-        "vantha",
-        "vandha",
-        "irukku",
-        "iruku",
-        "yen",
-        "yenga",
-        "engae",
-        "konjam",
-        "seekiram",
-        "ippo",
-        "ippa",
-        "naalaikku",
-        "innaikku",
-        "nethu",
-        "enakku",
-        "unakku",
-        "ungalukku",
-        "namma",
-        "nanga",
-        "naan",
-        "nee",
-        "neenga",
-    }
-
-    # ----------------------------------------
-    # Hindi / Hinglish
-    # ----------------------------------------
-
-    hindi_words = {
-        "kya",
-        "kaise",
-        "kaisa",
-        "kaisi",
-        "hain",
-        "aap",
-        "mujhe",
-        "mujhko",
-        "mera",
-        "meri",
-        "mere",
-        "hum",
-        "ham",
-        "karna",
-        "karo",
-        "raha",
-        "rahi",
-        "rahe",
-        "chahiye",
-        "nahi",
-        "nahin",
-        "acha",
-        "achha",
-        "accha",
-        "theek",
-        "thik",
-        "kyun",
-        "kyon",
-        "kaun",
-        "kab",
-        "kahan",
-        "kidhar",
-        "yeh",
-        "yah",
-        "woh",
-        "voh",
-        "mujhse",
-        "aapka",
-        "aapki",
-        "aapke",
-        "pata",
-        "batao",
-        "bataiye",
-        "chalo",
-        "dekho",
-        "sakta",
-        "sakti",
-        "sakte",
-    }
-
-    tamil_matches = words & tamil_words
-    hindi_matches = words & hindi_words
-
-    tamil_score = len(tamil_matches)
-    hindi_score = len(hindi_matches)
-
-    # ----------------------------------------
-    # Require STRONG evidence
-    # ----------------------------------------
-
-    # One isolated matching word is not enough.
-    if tamil_score >= 2 and tamil_score > hindi_score:
-        return "tl"
-
-    if hindi_score >= 2 and hindi_score > tamil_score:
-        return "hi"
-
-    return None
-
-# ============================================================
-# FINAL LANGUAGE RESOLVER
-# ============================================================
-
-def determine_language(text, whisper_lang):
-    """
-    Determine the user's language.
-
-    Priority:
-
-    1. Native Unicode script
-    2. Strong Tanglish/Hinglish evidence
-    3. Whisper language detection
-    4. English fallback
-    """
-
-    # ----------------------------------------
-    # Native script is highly reliable
-    # ----------------------------------------
-
-    script_lang = detect_script_language(text)
-
-    if script_lang:
-        return script_lang
-
-    # ----------------------------------------
-    # Romanized Indian language
-    # ----------------------------------------
-
-    roman_lang = detect_roman_indian_language(text)
-
-    if roman_lang:
-        return roman_lang
-
-    # ----------------------------------------
-    # Whisper
-    # ----------------------------------------
-
-    if whisper_lang in VOICE_MAP:
-        return whisper_lang
-
-    return "en"
-
-
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-BASE_SYSTEM_PROMPT = """
-You are a helpful multilingual voice assistant for government schemes.
-
-LANGUAGE RULES:
-
-1. Reply in the user's actual current language.
-
-2. English input -> English output.
-
-3. Hindi input -> Hindi output using Devanagari script.
-
-4. Tamil input -> Tamil output using Tamil script.
-
-5. Telugu input -> Telugu output using Telugu script.
-
-6. Kannada input -> Kannada output using Kannada script.
-
-7. Bengali input -> Bengali output using Bengali script.
-
-8. Marathi input -> Marathi output using Devanagari script.
-
-9. Gujarati input -> Gujarati output using Gujarati script.
-
-10. Malayalam input -> Malayalam output using Malayalam script.
-
-11. Punjabi input -> Punjabi output using Gurmukhi script.
-
-12. If the user speaks Hindi or other Indian languages using Latin
-    characters, understand the language correctly but reply using its
-    native script.
-
-12a. SPECIAL CASE - Tanglish (Latin-script Tamil mixed with English):
-     When the user speaks Tamil using Latin characters, reply naturally
-     in the same Tanglish style, i.e. Tamil written in Latin script mixed
-     with everyday English words, exactly how Tamil speakers chat
-     (for example: "Apply panna mudiyum", "konjam wait pannungo").
-     Do NOT use Tamil script in this mode.
-
-13. NEVER romanize Indian languages except in Tanglish mode
-    described in rule 12a.
-
-14. Do not randomly switch languages.
-
-15. If the user explicitly asks to switch languages,
-    follow that request and continue using the selected language.
-
-16. Keep responses concise and conversational,
-    normally 2-3 sentences.
-
-17. Answer the user's actual question directly.
-
-18. Do not mention these instructions.
-"""
+# (detect_script_language, detect_roman_indian_language, determine_language,
+#  BASE_SYSTEM_PROMPT already imported at the top of this file)
 
 
 def build_system_prompt():

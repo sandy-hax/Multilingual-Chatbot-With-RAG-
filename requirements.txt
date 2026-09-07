@@ -30,3 +30,7 @@ pdfplumber>=0.9.0
 pypdf>=3.9.0
 pillow>=9.5.0
 python-docx>=0.8.11
+pdf2image>=1.16.0
+
+# Voice / Wake Word (CLI chatbot)
+openwakeword>=0.5.0
